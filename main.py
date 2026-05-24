@@ -207,6 +207,7 @@ def send_message(user_id: str, friend_id: str, payload: MessageCreate):
     return message
 
 
+@app.get("/dev/seed")
 @app.post("/dev/seed")
 def seed_data():
     if users:

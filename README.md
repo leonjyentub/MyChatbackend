@@ -12,6 +12,7 @@ Open:
 
 - API root: http://127.0.0.1:8000/
 - API docs: http://127.0.0.1:8000/docs
+- Demo seed data: http://127.0.0.1:8000/dev/seed
 
 ## Deploy to Render
 
@@ -34,3 +35,4 @@ After deployment, test:
 
 - `https://YOUR-SERVICE.onrender.com/`
 - `https://YOUR-SERVICE.onrender.com/docs`
+- `https://YOUR-SERVICE.onrender.com/dev/seed`
