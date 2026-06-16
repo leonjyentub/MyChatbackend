@@ -23,6 +23,8 @@ automatically.
 2. Click **New** > **Blueprint**
 3. Connect the GitHub repo: `leonjyentub/MyChatbackend`
 4. Keep the detected `render.yaml` settings and create the service
+5. In the service environment variables, set `DATABASE_URL` to your Render
+   PostgreSQL internal connection string
 
 If you create a Web Service manually instead, use:
 
@@ -30,6 +32,11 @@ If you create a Web Service manually instead, use:
 - Build Command: `pip install -r requirements.txt`
 - Start Command: `uvicorn main:app --host 0.0.0.0 --port $PORT`
 - Health Check Path: `/`
+- Environment Variable:
+  - `DATABASE_URL`: your Render PostgreSQL internal connection string
+
+When `DATABASE_URL` is set, the API stores users, friendships, and messages in
+PostgreSQL. Without it, local development still uses the in-memory demo store.
 
 After deployment, test:
 
