@@ -1,10 +1,16 @@
 import os
-from datetime import date, datetime, timezone
+import base64
+import json
+from datetime import date, datetime, timedelta, timezone
+import hashlib
+import hmac
+import secrets
 from typing import Optional
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 from sqlalchemy import (
     Column,
@@ -44,6 +50,14 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int
+    role: str
+    user: dict
+
+
 class ProfileUpdate(BaseModel):
     name: str = Field(min_length=1, max_length=40)
     birthday: Optional[date] = None
@@ -55,13 +69,23 @@ class AddFriendRequest(BaseModel):
 
 
 class MessageCreate(BaseModel):
-    sender_id: str
+    sender_id: Optional[str] = None
     text: str = Field(min_length=1, max_length=1000)
 
 
 users: list[dict] = []
 friendships: set[tuple[str, str]] = set()
 messages: list[dict] = []
+
+security = HTTPBearer(auto_error=False)
+
+JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-change-me")
+JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "60"))
+PASSWORD_HASH_ITERATIONS = 100_000
+ADMIN_USERNAMES = {
+    username.strip() for username in os.getenv("ADMIN_USERNAMES", "").split(",") if username.strip()
+}
 
 
 def normalize_database_url(url: str) -> str:
@@ -116,6 +140,134 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def hash_password(password: str) -> str:
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt.encode("utf-8"),
+        PASSWORD_HASH_ITERATIONS,
+    ).hex()
+    return f"pbkdf2_sha256${PASSWORD_HASH_ITERATIONS}${salt}${digest}"
+
+
+def verify_password(password: str, stored_password: str) -> bool:
+    if stored_password.startswith("pbkdf2_sha256$"):
+        try:
+            _, iter_str, salt, expected = stored_password.split("$", 3)
+            digest = hashlib.pbkdf2_hmac(
+                "sha256",
+                password.encode("utf-8"),
+                salt.encode("utf-8"),
+                int(iter_str),
+            ).hex()
+            return hmac.compare_digest(digest, expected)
+        except (ValueError, TypeError):
+            return False
+
+    # Backward compatibility for demo users created with plaintext passwords.
+    return hmac.compare_digest(password, stored_password)
+
+
+def is_admin_username(username: str) -> bool:
+    return username in ADMIN_USERNAMES
+
+
+def create_access_token(user: dict) -> str:
+    now = datetime.now(timezone.utc)
+    expire_at = now + timedelta(minutes=JWT_EXPIRE_MINUTES)
+    role = "admin" if is_admin_username(user["username"]) else "user"
+    payload = {
+        "sub": user["id"],
+        "username": user["username"],
+        "role": role,
+        "iat": int(now.timestamp()),
+        "exp": int(expire_at.timestamp()),
+    }
+
+    header = {"alg": JWT_ALGORITHM, "typ": "JWT"}
+    header_segment = base64.urlsafe_b64encode(
+        json.dumps(header, separators=(",", ":")).encode("utf-8")
+    ).rstrip(b"=")
+    payload_segment = base64.urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    ).rstrip(b"=")
+    signing_input = b".".join([header_segment, payload_segment])
+    signature = hmac.new(
+        JWT_SECRET.encode("utf-8"), signing_input, hashlib.sha256
+    ).digest()
+    signature_segment = base64.urlsafe_b64encode(signature).rstrip(b"=")
+    return b".".join([header_segment, payload_segment, signature_segment]).decode("utf-8")
+
+
+def decode_access_token(token: str) -> dict:
+    def _b64decode(segment: str) -> bytes:
+        padding = "=" * (-len(segment) % 4)
+        return base64.urlsafe_b64decode((segment + padding).encode("utf-8"))
+
+    try:
+        header_segment, payload_segment, signature_segment = token.split(".")
+        header = json.loads(_b64decode(header_segment).decode("utf-8"))
+        if header.get("alg") != JWT_ALGORITHM:
+            raise ValueError("Invalid algorithm")
+
+        signing_input = f"{header_segment}.{payload_segment}".encode("utf-8")
+        expected_signature = hmac.new(
+            JWT_SECRET.encode("utf-8"), signing_input, hashlib.sha256
+        ).digest()
+        actual_signature = _b64decode(signature_segment)
+        if not hmac.compare_digest(expected_signature, actual_signature):
+            raise ValueError("Invalid signature")
+
+        payload = json.loads(_b64decode(payload_segment).decode("utf-8"))
+        exp = payload.get("exp")
+        if not isinstance(exp, int) or exp < int(datetime.now(timezone.utc).timestamp()):
+            raise ValueError("Token expired")
+    except (ValueError, TypeError, json.JSONDecodeError):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token",
+        ) from None
+    return payload
+
+
+def unauthorized_exception() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Authentication required",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+) -> dict:
+    if not credentials:
+        raise unauthorized_exception()
+
+    payload = decode_access_token(credentials.credentials)
+    user_id = payload.get("sub")
+    if not user_id:
+        raise unauthorized_exception()
+
+    user = find_user(user_id)
+    user["role"] = payload.get("role", "user")
+    return user
+
+
+def ensure_self_or_admin(path_user_id: str, current_user: dict) -> None:
+    """Allow access only to the resource owner or an admin user.
+
+    path_user_id: the user id embedded in the request path.
+    current_user: the authenticated user resolved from the JWT token.
+    """
+    is_owner = current_user["id"] == path_user_id
+    is_admin = current_user.get("role") == "admin"
+
+    if not is_owner and not is_admin:
+        raise HTTPException(status_code=403, detail="Permission denied")
+
+
 def public_user(user: dict) -> dict:
     birthday = user.get("birthday")
     return {
@@ -165,7 +317,7 @@ def find_user_by_username(username: str) -> Optional[dict]:
 
 
 def friendship_key(user_a: str, user_b: str) -> tuple[str, str]:
-    return tuple(sorted([user_a, user_b]))
+    return (user_a, user_b) if user_a < user_b else (user_b, user_a)
 
 
 def ensure_friends(user_a: str, user_b: str) -> None:
@@ -218,7 +370,7 @@ def register(payload: RegisterRequest):
     user = {
         "id": uuid4().hex[:8],
         "username": payload.username,
-        "password": payload.password,
+        "password": hash_password(payload.password),
         "name": payload.display_name or payload.username,
         "birthday": None,
         "avatar_url": None,
@@ -242,18 +394,40 @@ def register(payload: RegisterRequest):
 @app.post("/auth/login")
 def login(payload: LoginRequest):
     user = find_user_by_username(payload.username)
-    if not user or user["password"] != payload.password:
+    if not user or not verify_password(payload.password, user["password"]):
         raise HTTPException(status_code=401, detail="Invalid username or password")
-    return public_user(user)
+
+    # Upgrade legacy plaintext passwords to hashed form after successful login.
+    if not user["password"].startswith("pbkdf2_sha256$"):
+        new_hash = hash_password(payload.password)
+        if engine:
+            with engine.begin() as conn:
+                conn.execute(
+                    update(users_table)
+                    .where(users_table.c.id == user["id"])
+                    .values(password=new_hash)
+                )
+        else:
+            user["password"] = new_hash
+
+    role = "admin" if is_admin_username(user["username"]) else "user"
+    return TokenResponse(
+        access_token=create_access_token(user),
+        expires_in=JWT_EXPIRE_MINUTES * 60,
+        role=role,
+        user=public_user(user),
+    )
 
 
 @app.get("/users/{user_id}")
-def get_user(user_id: str):
+def get_user(user_id: str, current_user: dict = Depends(get_current_user)):
+    ensure_self_or_admin(user_id, current_user)
     return public_user(find_user(user_id))
 
 
 @app.put("/users/{user_id}")
-def update_profile(user_id: str, payload: ProfileUpdate):
+def update_profile(user_id: str, payload: ProfileUpdate, current_user: dict = Depends(get_current_user)):
+    ensure_self_or_admin(user_id, current_user)
     user = find_user(user_id)
     changes = {
         "name": payload.name,
@@ -272,7 +446,8 @@ def update_profile(user_id: str, payload: ProfileUpdate):
 
 
 @app.get("/users/{user_id}/friends")
-def get_friends(user_id: str):
+def get_friends(user_id: str, current_user: dict = Depends(get_current_user)):
+    ensure_self_or_admin(user_id, current_user)
     find_user(user_id)
     if engine:
         with engine.begin() as conn:
@@ -296,7 +471,8 @@ def get_friends(user_id: str):
 
 
 @app.post("/users/{user_id}/friends")
-def add_friend(user_id: str, payload: AddFriendRequest):
+def add_friend(user_id: str, payload: AddFriendRequest, current_user: dict = Depends(get_current_user)):
+    ensure_self_or_admin(user_id, current_user)
     find_user(user_id)
     find_user(payload.friend_id)
     if user_id == payload.friend_id:
@@ -319,7 +495,8 @@ def add_friend(user_id: str, payload: AddFriendRequest):
 
 
 @app.get("/users/{user_id}/chats")
-def get_chats(user_id: str):
+def get_chats(user_id: str, current_user: dict = Depends(get_current_user)):
+    ensure_self_or_admin(user_id, current_user)
     find_user(user_id)
     chats = []
     for friend in get_friends(user_id):
@@ -337,7 +514,8 @@ def get_chats(user_id: str):
 
 
 @app.get("/chats/{user_id}/{friend_id}/messages")
-def get_messages(user_id: str, friend_id: str):
+def get_messages(user_id: str, friend_id: str, current_user: dict = Depends(get_current_user)):
+    ensure_self_or_admin(user_id, current_user)
     find_user(user_id)
     find_user(friend_id)
     ensure_friends(user_id, friend_id)
@@ -345,11 +523,17 @@ def get_messages(user_id: str, friend_id: str):
 
 
 @app.post("/chats/{user_id}/{friend_id}/messages")
-def send_message(user_id: str, friend_id: str, payload: MessageCreate):
+def send_message(
+    user_id: str,
+    friend_id: str,
+    payload: MessageCreate,
+    current_user: dict = Depends(get_current_user),
+):
+    ensure_self_or_admin(user_id, current_user)
     find_user(user_id)
     find_user(friend_id)
     ensure_friends(user_id, friend_id)
-    if payload.sender_id != user_id:
+    if payload.sender_id and payload.sender_id != user_id:
         raise HTTPException(status_code=400, detail="Sender must match current user")
 
     message = {
@@ -382,7 +566,7 @@ def seed_data():
     alice = {
         "id": "alice001",
         "username": "alice",
-        "password": "1234",
+        "password": hash_password("1234"),
         "name": "Alice",
         "birthday": date(2001, 1, 1),
         "avatar_url": "https://i.pravatar.cc/150?img=1",
@@ -391,7 +575,7 @@ def seed_data():
     bob = {
         "id": "bob002",
         "username": "bob",
-        "password": "1234",
+        "password": hash_password("1234"),
         "name": "Bob",
         "birthday": date(2002, 2, 2),
         "avatar_url": "https://i.pravatar.cc/150?img=2",
