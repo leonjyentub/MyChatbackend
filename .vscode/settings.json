@@ -2,5 +2,6 @@
   "markdown-pdf.displayHeaderFooter": false,
   "markdown-pdf.options": {
     "displayHeaderFooter": false
-  }
+  },
+  "markdown.marp.html": "all"
 }

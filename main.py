@@ -362,7 +362,7 @@ def message_between(user_a: str, user_b: str) -> list[dict]:
 
 @app.get("/")
 def root():
-    return {"message": "Chat API is running"}
+    return {"message": "Chat API is running", "version": "1.0"}
 
 
 @app.post("/auth/register")
