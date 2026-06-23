@@ -98,15 +98,16 @@ style: |
 
 # JWT 教學範例修改總覽
 
-> 課程: 後端 API 安全實作
-> 
+> 課程: 後端 API 安全實作 
 > 主題: JWT 登入、驗證與功能權限控管
-> 
 > 專案: MyChatbackend
 
 ## 解釋內容
 - 目標: 將原本「明碼密碼 + 無驗證」升級為「JWT 登入 + Bearer 驗證 + 功能權限控管」
 - 範圍: 註冊、登入、使用者資料、好友、聊天室、訊息 API
+
+---
+# JWT 教學範例修改總覽
 
 ## 流程
 ```mermaid
@@ -142,32 +143,34 @@ flowchart LR
 4. authorize: 驗證 self-or-admin
 
 ## 公式說明
-- 系統風險可簡化為:
+- 系統風險可簡化為 (過短效 token 可降低長期風險暴露):
   $$
   Risk = P(token\_leak) \times Impact
   $$
-- 透過短效 token 可降低長期風險暴露
 
 ---
 
 # 密碼儲存改造: PBKDF2
+
+<div style="display: flex; gap: 30px; align-items: flex-start;">
+<div style="flex: 1;">
 
 ## 解釋內容
 - 註冊時不再儲存明碼，改為 `pbkdf2_sha256$iterations$salt$hash`
 - 登入驗證採用同一演算法重算並比對
 - 舊資料若是明碼，登入成功後自動升級為雜湊
 
+</div>
+<div style="flex: 1;">
+
 ## 流程
 1. 生成隨機 salt
-2. 使用 PBKDF2-HMAC-SHA256 計算 hash
+2. 使用 PBKDF2(**HMAC-SHA256**) 計算 hash
 3. 儲存演算法、回合數、salt、hash
 4. 登入時重新計算並 compare_digest
 
-## 公式說明
-- 密碼衍生:
-  $$
-  DK = PBKDF2(HMAC\text{-}SHA256,\ password,\ salt,\ iterations)
-  $$
+</div>
+</div>
 
 ---
 
@@ -178,14 +181,8 @@ flowchart LR
 - payload 包含 `sub`, `username`, `role`, `iat`, `exp`
 - 以 HS256 進行簽章，確保內容不可竄改
 
-## 流程
-1. 建立 header 與 payload
-2. Base64URL 編碼
-3. 以 `JWT_SECRET` 做 HMAC-SHA256 簽章
-4. 組成 `header.payload.signature`
-
 ## 公式說明
-- JWT 組成:
+- JWT 組成: 
   $$
   JWT = b64url(header) . b64url(payload) . b64url(signature)
   $$
@@ -209,6 +206,10 @@ flowchart LR
 3. 重新計算 signature 並 compare_digest
 4. 檢查 `exp >= now`
 
+---
+
+# JWT 驗證機制
+
 ## 公式說明
 - 時效驗證條件:
   $$
@@ -229,6 +230,9 @@ flowchart LR
 - Token 的 `sub` 對應到使用者 id
 - 在 FastAPI 中，`Depends(...)` 代表「這個參數不是直接由使用者傳入，而是先由框架幫你準備好」
 
+---
+
+# 路由保護: Current User 依賴注入
 ## 流程
 1. 路由進入前先執行 dependency
 2. 解 token 取得 `sub`
@@ -256,15 +260,6 @@ flowchart LR
 3. 執行 `get_current_user`
 4. 若成功，將回傳值注入 `current_user` 後再執行 handler
 
-## 公式說明
-- 依賴注入可抽象成:
-  $$
-  current\_user = dependency(request)
-  $$
-  $$
-  response = handler(request,\ current\_user)
-  $$
-
 ---
 
 # Depends、Helper Function、Decorator 的差別
@@ -272,35 +267,26 @@ flowchart LR
 ## 解釋內容
 - Helper function: 由你在 handler 裡手動呼叫，例如 `ensure_self_or_admin(...)`
 - Dependency: 由 FastAPI 在進入 handler 前自動執行，例如 `Depends(get_current_user)`
-- Decorator: 由 Python 在函式外層包裝邏輯，通常用於通用攔截，但在 FastAPI 中要處理參數與文件會比較麻煩
+- Decorator: 由 Python 在函式外層包裝邏輯，通常用於通用攔截，但**在 FastAPI 中要處理參數與文件會比較麻煩**
 
 ## 流程
 1. Helper function 模式: handler 先開始，再手動呼叫共用函式
-2. Dependency 模式: 框架先執行共用函式，再進 handler
+2. Dependency 模式: 框架先執行共用函式，再進 handler (參數驗證和 OpenAPI 整合)
 3. Decorator 模式: Python 先包裝 handler，再由包裝後函式接管流程
-4. 對 API 框架而言，dependency 最能與參數驗證和 OpenAPI 整合
-
-## 公式說明
-- 三者的控制位置可表示為:
-  $$
-  Helper = handler + manual\ call
-  $$
-  $$
-  Dependency = framework\ pre\text{-}handler\ injection
-  $$
-  $$
-  Decorator = wrapped(handler)
-  $$
 
 ---
 
-# 為什麼這支程式比較適合 Depends
+# 為什麼目前範例程式比較適合 Depends
 
 ## 解釋內容
 - 這支程式的登入資訊來自 HTTP Header 內的 Bearer Token，這本來就是 request 前置處理，非常適合交給 dependency
 - `get_current_user` 會先驗證 token、找出使用者，再把結果提供給多支 API 重用
 - `ensure_self_or_admin` 目前保留成 helper function 也合理，因為它還需要搭配每支路由自己的 `user_id` 參數做授權判斷
 - 也就是說，這個專案最自然的分工是: 認證用 dependency，授權用 helper function
+
+---
+
+# 為什麼目前範例程式比較適合 Depends
 
 ## 流程
 1. `Depends(get_current_user)` 統一處理登入身分
@@ -352,7 +338,7 @@ flowchart TD
 # 功能權限: Self or Admin
 
 ## 解釋內容
-- 採最直觀 RBAC 規則: 本人可操作自己的資料，admin 可跨帳號操作
+- 採最直觀 RBAC (Role-Based Access Control)規則: 本人可操作自己的資料，admin 可跨帳號操作
 - admin 由環境變數 `ADMIN_USERNAMES` 控制
 - 權限不足回傳 403
 - 這一層真正執行判斷的核心函式就是 `ensure_self_or_admin(path_user_id, current_user)`
@@ -360,14 +346,7 @@ flowchart TD
 ## 流程
 1. 從 path 取得 `user_id`
 2. 從 token 取得 `current_user.id` 與 `role`
-3. 執行 self-or-admin 檢查
-4. 通過才進入商業邏輯
-
-## 公式說明
-- 授權函式:
-  $$
-  authorize(u_{path}, u_{token}, role) = (u_{path}=u_{token}) \lor (role=admin)
-  $$
+3. 執行 self-or-admin 檢查，通過才進入商業邏輯
 
 ---
 
@@ -407,12 +386,9 @@ flowchart TD
 3. 呼叫 `ensure_self_or_admin`
 4. 通過後才繼續查資料、更新資料或送訊息
 
-## 公式說明
-- 共用函式的教學價值在於把授權寫成可重複使用的規則:
-  $$
-  Route\ Access = Authentication + Authorization\ Rule
-  $$
-
+$$
+Route\ Access = Authentication + Authorization\ Rule
+$$
 ---
 
 # 程式碼逐行解說: ensure_self_or_admin
@@ -426,6 +402,10 @@ flowchart TD
 2. 再看 `is_owner`，判斷登入者是不是操作自己的資源
 3. 接著看 `is_admin`，判斷登入者是否具有管理者角色
 4. 最後若兩者都不是，就拋出 `403 Permission denied`
+
+---
+
+# 程式碼逐行解說: ensure_self_or_admin
 
 ## 程式片段
 ```python
@@ -480,43 +460,13 @@ def ensure_self_or_admin(path_user_id: str, current_user: dict) -> None:
 ## 解釋內容
 - 401: 未登入、token 無效、token 過期
 - 403: 已登入但沒有操作權限
+- 200: 登入成功
 - 這是 API 安全設計最常見的分層
 
 ## 流程
 1. 先判斷是否 authenticated
 2. 再判斷是否 authorized
 3. 根據失敗階段回傳對應狀態碼
-
-## 公式說明
-- 狀態碼決策:
-  $$
-  status =
-  \begin{cases}
-  401, & \neg authenticated \\
-  403, & authenticated \land \neg authorized \\
-  200, & authenticated \land authorized
-  \end{cases}
-  $$
-
----
-
-# 操作示例與驗證案例
-
-## 解釋內容
-- 建議準備 4 組測試: 正常登入、過期 token、跨帳號操作、admin 跨帳號操作
-- 用這 4 組可快速驗證整體安全鏈是否完整
-
-## 流程
-1. 正常使用者登入並呼叫自己的 API (預期 200)
-2. 同一 token 呼叫他人 API (預期 403)
-3. 破壞 token 簽章再呼叫 (預期 401)
-4. admin 帳號呼叫他人 API (預期 200)
-
-## 公式說明
-- 測試覆蓋率觀點:
-  $$
-  Coverage = \frac{\#passed\ security\ scenarios}{\#total\ scenarios}
-  $$
 
 ---
 
@@ -531,9 +481,3 @@ def ensure_self_or_admin(path_user_id: str, current_user: dict) -> None:
 1. 導入 refresh token 流程
 2. 規劃角色矩陣與權限表
 3. 建立安全事件監控與告警
-
-## 公式說明
-- 可用簡化成本效益評估:
-  $$
-  Priority = \frac{Security\ Gain}{Implementation\ Cost}
-  $$
